@@ -19,7 +19,7 @@ Examples
   # See what would be downloaded without downloading anything
   python organism_dl.py "terence mckenna" --dry-run
 
-  # Point at a person's page directly if name matching misses it
+  # Point at a person's page directly
   python organism_dl.py --url https://www.organism.earth/library/author/terence-mckenna
 
 Files are saved to ./downloads/<Person Name>/. Re-running skips files that
@@ -139,6 +139,7 @@ class LinkParser(HTMLParser):
         self._in_title = False
         self._h1 = None
         self._in_h1 = False
+        self._in_audio = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
@@ -146,6 +147,15 @@ class LinkParser(HTMLParser):
             if v and (k in ("src", "href", "content") or k.startswith("data-")):
                 if urllib.parse.urlsplit(v).path.lower().endswith(AUDIO_EXTS):
                     self.media.add(v)
+        # Players and download buttons whose URL has no .mp3-style extension
+        src = attrs.get("src") or attrs.get("href")
+        if src:
+            if (tag == "audio" or (tag == "source" and self._in_audio)
+                    or (attrs.get("type") or "").lower().startswith("audio/")
+                    or (tag == "a" and "download" in attrs and not src.startswith(("#", "javascript:")))):
+                self.media.add(src)
+        if tag == "audio":
+            self._in_audio = True
         if tag == "a" and attrs.get("href"):
             self._a_href = attrs["href"]
             self._a_text = []
@@ -163,6 +173,8 @@ class LinkParser(HTMLParser):
             self._in_title = False
         elif tag == "h1":
             self._in_h1 = False
+        elif tag == "audio":
+            self._in_audio = False
 
     def handle_data(self, data):
         if self._a_href is not None:
@@ -270,7 +282,7 @@ def discover_people(fetcher, start=BASE_URL, max_index_pages=60):
     return people
 
 
-def match_people(people, queries):
+def match_people(people, queries, base=BASE_URL):
     """Map each query to matching person URLs by name or URL slug."""
     out = {}
     for q in queries:
@@ -280,63 +292,94 @@ def match_people(people, queries):
             hits = [u for u, n in people.items()
                     if qs in slug(n) or qs in slug(urllib.parse.urlsplit(u).path)]
         if not hits:
-            log(f"  ! no person matching '{q}' found on the index page")
+            guess = urllib.parse.urljoin(base, "author/" + re.sub(r"[^a-z0-9]+", "-", q.lower()).strip("-"))
+            log(f"  ! '{q}' not in the index; trying {guess}")
+            out[guess] = q.title()
         for u in hits:
             out[u] = people[u]
     return out
 
 
 # --------------------------------------------------------------------------- #
-# Crawl a person's pages for audio
+# Step 1: author page -> document links.  Step 2: document page -> audio.
 # --------------------------------------------------------------------------- #
-def crawl_person(fetcher, person_url, max_depth=2, max_pages=800):
-    """Breadth-first crawl starting at a person's page.
+DOC_SEGMENT = "/library/document/"
+AUDIO_HINT_RE = re.compile(r"audio|listen|download|\bmp3\b", re.IGNORECASE)
 
-    Depth 0 = the person page (plus its pagination),
-    depth 1 = the talks/documents it links to, depth 2 = one hop further
-    (handles 'document -> audio page -> file' layouts). Stays inside /library/
-    and never wanders onto another person's page.
-    """
+
+def list_documents(fetcher, person_url, max_pages=200):
+    """Read a person's page (and its pagination) and return
+    {document_url: link_text} for every /library/document/... it links to."""
     root = normalize(person_url)
-    library_prefix = "/library/"
-    found = {}  # audio_url -> (title, page_url)
-    seen = set()
-    queue = deque([(root, 0)])
-    pages = 0
     person_path = urllib.parse.urlsplit(root).path.rstrip("/")
-
-    while queue and pages < max_pages:
-        url, depth = queue.popleft()
+    docs, other = {}, {}
+    seen, queue = set(), deque([root])
+    while queue and len(seen) < max_pages:
+        url = queue.popleft()
         if url in seen:
             continue
         seen.add(url)
         final, text = fetcher.get_html(url)
-        pages += 1
         if not text:
             continue
-        p, links, media = parse(final, text)
-        title = p.heading
-        for m in media:
-            if m not in found:
-                found[m] = (title, final)
-                log(f"    + {os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(m).path))}")
-
+        _, links, _ = parse(final, text)
         for href, label in links:
-            path = urllib.parse.urlsplit(href).path
+            if not same_site(href, root):
+                continue
+            split = urllib.parse.urlsplit(href)
+            path = split.path.rstrip("/")
             low = path.lower()
-            if low.endswith(AUDIO_EXTS):
-                if href not in found:
-                    found[href] = (label or title, final)
-                    log(f"    + {os.path.basename(urllib.parse.unquote(path))}")
-                continue
-            if href in seen or not same_site(href, root) or low.endswith(SKIP_EXTS):
-                continue
-            is_pagination = path.rstrip("/").startswith(person_path) or (
-                href.split("?")[0] == final.split("?")[0] and "page" in href.lower())
-            if is_pagination:
-                queue.append((href, depth))  # same depth: still the listing
-            elif depth < max_depth and library_prefix in low and not is_person_url(href):
-                queue.append((href, depth + 1))
+            if DOC_SEGMENT in low + "/":
+                if len(label) > len(docs.get(href, "")):
+                    docs[href] = label
+                else:
+                    docs.setdefault(href, label)
+            elif (path == person_path and "page" in split.query.lower()) or path.startswith(person_path + "/"):
+                if href not in seen:
+                    queue.append(href)  # pagination of the author listing
+            elif ("/library/" in low and low != "/library" and not is_person_url(href)
+                  and not low.endswith(SKIP_EXTS)):
+                other.setdefault(href, label)
+    if not docs and other:
+        log("  ! no /library/document/ links on this page; trying every library link instead")
+        return other
+    return docs
+
+
+def audio_on_page(fetcher, url, follow_hint_links=True):
+    """Return (page_heading, [audio_urls]) for one document page. If the page
+    has no audio itself, follow its 'audio'/'listen'/'download' links one hop."""
+    final, text = fetcher.get_html(url)
+    if not text:
+        return "", []
+    p, links, media = parse(final, text)
+    audio = set(media)
+    audio.update(h for h, _ in links if urllib.parse.urlsplit(h).path.lower().endswith(AUDIO_EXTS))
+    if not audio and follow_hint_links:
+        for href, label in links:
+            low = urllib.parse.urlsplit(href).path.lower()
+            if (href != final and same_site(href, final) and DOC_SEGMENT not in low
+                    and not is_person_url(href) and not low.endswith(SKIP_EXTS)
+                    and AUDIO_HINT_RE.search(f"{label} {low}")):
+                audio.update(audio_on_page(fetcher, href, follow_hint_links=False)[1])
+    return p.heading, sorted(audio)
+
+
+def crawl_person(fetcher, person_url):
+    """Return {audio_url: (title, document_url)} for one person."""
+    docs = list_documents(fetcher, person_url)
+    log(f"  {len(docs)} document(s) listed; checking each for audio ...")
+    found = {}
+    for i, (doc, label) in enumerate(sorted(docs.items(), key=lambda kv: kv[1].lower()), 1):
+        heading, audio = audio_on_page(fetcher, doc)
+        slug_title = urllib.parse.unquote(doc.rstrip("/").rsplit("/", 1)[-1]).replace("-", " ").capitalize()
+        title = heading or label or slug_title
+        # A generic site-wide <h1> isn't a title: fall back to the link text
+        if label and heading and slug(heading) in ("organism", "organismearth", "library"):
+            title = label
+        log(f"    [{i}/{len(docs)}] {title}: " + (f"{len(audio)} audio" if audio else "no audio"))
+        for a in audio:
+            found.setdefault(a, (title, doc))
     return found
 
 
@@ -344,12 +387,12 @@ def crawl_person(fetcher, person_url, max_depth=2, max_pages=800):
 # Download
 # --------------------------------------------------------------------------- #
 def filename_for(url, title):
+    """Name the file after its document's title, keeping the audio extension."""
     base = os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(url).path))
     stem, ext = os.path.splitext(base)
-    # Opaque names like 'a8f3c1.mp3' -> use the page title instead
-    if title and (len(stem) < 4 or re.fullmatch(r"[0-9a-f\-_]{8,}", stem.lower())):
-        return safe_name(f"{title}{ext}")
-    return safe_name(base)
+    if ext.lower() not in AUDIO_EXTS:
+        ext = ".mp3"
+    return safe_name(f"{title or stem}{ext}")
 
 
 def download(fetcher, url, dest):
@@ -387,7 +430,7 @@ def download_all(fetcher, items, outdir, workers):
     os.makedirs(outdir, exist_ok=True)
     used = set()
     jobs = []
-    for url, (title, _page) in sorted(items.items()):
+    for url, (title, _page) in sorted(items.items(), key=lambda kv: (kv[1][0].lower(), kv[0])):
         name = filename_for(url, title)
         stem, ext = os.path.splitext(name)
         n = 2
@@ -396,6 +439,12 @@ def download_all(fetcher, items, outdir, workers):
             n += 1
         used.add(name.lower())
         jobs.append((url, os.path.join(outdir, name)))
+
+    with open(os.path.join(outdir, "index.tsv"), "w", encoding="utf-8") as f:
+        f.write("file\ttitle\tdocument_page\taudio_url\n")
+        for (url, dest) in jobs:
+            title, page = items[url]
+            f.write(f"{os.path.basename(dest)}\t{title}\t{page}\t{url}\n")
 
     stats = {"done": 0, "skip": 0, "fail": 0}
 
@@ -419,7 +468,7 @@ def download_all(fetcher, items, outdir, workers):
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
-def pick_interactively(people):
+def pick_interactively(people, base=BASE_URL):
     names = sorted(people.items(), key=lambda kv: kv[1].lower())
     for i, (_u, n) in enumerate(names, 1):
         print(f"  {i:3d}. {n}")
@@ -438,7 +487,7 @@ def pick_interactively(people):
             chosen[names[int(part) - 1][0]] = names[int(part) - 1][1]
         else:
             text_queries.append(part)
-    chosen.update(match_people(people, text_queries))
+    chosen.update(match_people(people, text_queries, base))
     return chosen
 
 
@@ -450,7 +499,6 @@ def main(argv=None):
     ap.add_argument("--dry-run", action="store_true", help="find audio files but don't download them")
     ap.add_argument("-o", "--out", default="downloads", help="output folder (default: ./downloads)")
     ap.add_argument("--base", default=BASE_URL, help=f"library index URL (default: {BASE_URL})")
-    ap.add_argument("--depth", type=int, default=2, help="how many links deep to follow from a person page (default 2)")
     ap.add_argument("--workers", type=int, default=3, help="parallel downloads (default 3)")
     ap.add_argument("--delay", type=float, default=0.5, help="seconds between requests (default 0.5)")
     args = ap.parse_args(argv)
@@ -466,7 +514,7 @@ def main(argv=None):
     if args.list or args.people or not args.url:
         log(f"Reading library index {args.base} ...")
         people = discover_people(fetcher, args.base)
-        if not people and (args.list or not args.url):
+        if not people and (args.list or not (args.url or args.people)):
             log("No person links found on the index. The site layout may have changed;\n"
                 "open a person's page in your browser and pass it with --url instead.")
             return 1
@@ -476,9 +524,9 @@ def main(argv=None):
             log(f"\n{len(people)} people.")
             return 0
         if args.people:
-            targets.update(match_people(people, args.people))
+            targets.update(match_people(people, args.people, args.base))
         elif not args.url:
-            targets.update(pick_interactively(people))
+            targets.update(pick_interactively(people, args.base))
 
     if not targets:
         log("Nothing selected.")
@@ -486,15 +534,19 @@ def main(argv=None):
 
     grand = {"done": 0, "skip": 0, "fail": 0, "found": 0}
     for url, name in targets.items():
+        # Use the author page's own spelling of the name (e.g. "McKenna")
+        heading = parse(*fetcher.get_html(url))[0].heading
+        if heading and slug(name) in slug(heading):
+            name = heading.split("|")[0].split(" - ")[0].strip() or name
         log(f"\n== {name}  ({url})")
         log("  scanning for audio ...")
-        items = crawl_person(fetcher, url, max_depth=args.depth)
+        items = crawl_person(fetcher, url)
         grand["found"] += len(items)
         log(f"  {len(items)} audio file(s) found")
         if not items:
             continue
         if args.dry_run:
-            for a, (t, page) in sorted(items.items()):
+            for a, (t, page) in sorted(items.items(), key=lambda kv: kv[1][0].lower()):
                 print(f"    {filename_for(a, t):60s} {a}")
             continue
         stats = download_all(fetcher, items, os.path.join(args.out, safe_name(name)), args.workers)
